@@ -414,6 +414,14 @@ def test_open_record_recalculates_and_can_be_undone(open_app):
     assert page.input_value('[data-path="capacity"]') == "1000"
     expect(page.locator("#results")).to_be_visible(timeout=5000)
     expect(page.locator("#break-even")).to_contain_text("864 билета")
+    # Страница уехала к результатам, а «Вернуть мою форму» всё равно на экране
+    page.wait_for_timeout(600)  # плавная прокрутка
+    assert page.evaluate("""() => {
+        const r = document.getElementById('undo-btn').getBoundingClientRect();
+        return r.top >= 0 && r.bottom <= window.innerHeight && window.scrollY > 0;
+    }""")
+    page.click("#undo-close")
+    expect(page.locator("#undo-bar")).to_be_hidden()
 
     page.reload()  # открытая запись стала черновиком
     assert page.input_value('[data-path="capacity"]') == "1000"

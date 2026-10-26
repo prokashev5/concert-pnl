@@ -769,6 +769,7 @@ function setupHistory(form, storage, { edited, recalculate }) {
 
   function hideUndo() {
     undoBar.hidden = true;
+    document.body.classList.remove("has-undo");
     previousDraft = null;
   }
 
@@ -796,6 +797,7 @@ function setupHistory(form, storage, { edited, recalculate }) {
     previousDraft ??= current;
     document.getElementById("undo-text").textContent = `Открыт «${record.name}».`;
     undoBar.hidden = false;
+    document.body.classList.add("has-undo");
     form.scrollIntoView({ behavior: "smooth", block: "start" });
     recalculate();
   }
@@ -878,6 +880,7 @@ function setupHistory(form, storage, { edited, recalculate }) {
     if (previousDraft) showForm(previousDraft);
     hideUndo();
   });
+  document.getElementById("undo-close").addEventListener("click", hideUndo);
   form.addEventListener("input", hideUndo);
   saveButton.addEventListener("click", save);
 
