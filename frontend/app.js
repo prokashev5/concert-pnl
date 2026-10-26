@@ -75,6 +75,113 @@ function formatUnits(units) {
   return formatShare(unitsToShare(units));
 }
 
+// ---------- История: формат записи (чистые функции, без DOM) ----------
+
+const HISTORY_PREFIX = "calc_";
+const HISTORY_LIMIT = 50;
+const CLOUD_MAX_BYTES = 4096; // лимит значения CloudStorage; считаем в байтах UTF-8 — с запасом
+const CLOUD_TIMEOUT_MS = 10_000;
+const RECORD_VERSION = 1;
+
+const isStr = (v) => typeof v === "string";
+const isRowOf = (n) => (row) => Array.isArray(row) && row.length === n && row.every(isStr);
+
+/** Черновик формы -> компактный вид: строки массивами, пустые статьи расходов выкидываем. */
+function compactDraft(draft) {
+  return {
+    c: draft.capacity,
+    k: draft.comps,
+    t: draft.tiers.map((t) => [t.name, t.price, t.quantity]),
+    x: draft.costs.filter((c) => c.amount.trim() !== "").map((c) => [c.name, c.amount]),
+    pt: draft.per_ticket_cost,
+    f: draft.ticketing_fee_rate,
+    m: draft.tax_mode,
+    r: draft.tax_rate,
+    vat: draft.vat_rate,
+    s: draft.scenarios.map((s) => [s.sell_through, s.probability]),
+  };
+}
+
+/** Обратно в формат readDraft; null, если структура чужая или битая. */
+function expandDraft(d) {
+  if (!d || typeof d !== "object") return null;
+  const scalars = [d.c, d.k, d.pt, d.f, d.m, d.r, d.vat];
+  if (!scalars.every(isStr)) return null;
+  if (![d.t, d.x, d.s].every(Array.isArray)) return null;
+  if (!d.t.every(isRowOf(3)) || !d.x.every(isRowOf(2)) || !d.s.every(isRowOf(2))) return null;
+  return {
+    capacity: d.c,
+    comps: d.k,
+    tiers: d.t.map(([name, price, quantity]) => ({ name, price, quantity })),
+    costs: d.x.map(([name, amount]) => ({ name, amount })),
+    per_ticket_cost: d.pt,
+    ticketing_fee_rate: d.f,
+    tax_mode: d.m,
+    tax_rate: d.r,
+    vat_rate: d.vat,
+    scenarios: d.s.map(([sell_through, probability]) => ({ sell_through, probability })),
+  };
+}
+
+/** summary: {net: прибыль базового сценария строкой, be: билеты безубыточности или null}. */
+function packRecord(name, savedAt, draft, summary) {
+  return JSON.stringify({ v: RECORD_VERSION, name, savedAt, d: compactDraft(draft), s: summary });
+}
+
+function unpackRecord(raw) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!data || data.v !== RECORD_VERSION || !isStr(data.name) || !Number.isFinite(data.savedAt)) return null;
+  const draft = expandDraft(data.d);
+  const summary = data.s;
+  if (!draft || !summary || !isStr(summary.net)) return null;
+  if (summary.be !== null && !Number.isInteger(summary.be)) return null;
+  return { name: data.name, savedAt: data.savedAt, draft, summary };
+}
+
+function byteLength(text) {
+  return new TextEncoder().encode(text).length;
+}
+
+function newHistoryKey() {
+  // Время + случайный хвост: два устройства в одну миллисекунду не перезапишут друг друга
+  const random = Math.floor(Math.random() * 36 ** 4).toString(36).padStart(4, "0");
+  return `${HISTORY_PREFIX}${Date.now().toString(36)}${random}`;
+}
+
+// ---------- CloudStorage Telegram ----------
+
+class CloudTimeout extends Error {}
+
+function cloudStorageOf(tg) {
+  try {
+    return tg?.isVersionAtLeast?.("6.9") && tg.CloudStorage ? tg.CloudStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Callback -> Promise. Без моста к Telegram callback не вызывается никогда — отсюда таймаут. */
+function cloudCall(storage, method, ...args) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new CloudTimeout(method)), CLOUD_TIMEOUT_MS);
+    try {
+      storage[method](...args, (error, result) => {
+        clearTimeout(timer);
+        if (error) reject(new Error(String(error)));
+        else resolve(result);
+      });
+    } catch (error) {
+      clearTimeout(timer); // старая версия Telegram бросает синхронно
+      reject(error);
+    }
+  });
+}
+
 // ---------- Конфигурация формы ----------
 
 const DRAFT_KEY = "concert-pnl:form:v1";
@@ -435,12 +542,22 @@ function renderReport(report) {
   results.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+// Последний актуальный расчёт: ровно те цифры, по которым он сделан. null — сохранять нечего
+let lastCalc = null;
+
+function hideSaveBox() {
+  lastCalc = null;
+  document.getElementById("save-box").hidden = true;
+}
+
 function markResultsStale() {
   document.getElementById("results").classList.add("stale");
+  hideSaveBox();
 }
 
 function hideResults() {
   document.getElementById("results").hidden = true;
+  hideSaveBox();
 }
 
 // ---------- Строки списков ----------
@@ -565,6 +682,221 @@ function applyDraft(form, draft) {
   });
 }
 
+function refreshFormState(form) {
+  updateAddButtons();
+  updateSeatsHint(form);
+  updateProbabilityHint();
+  updateTaxHint(form);
+  clearErrors();
+}
+
+// ---------- История расчётов ----------
+
+function defaultCalcName() {
+  return `Концерт ${new Date().toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" })}`;
+}
+
+function summaryOf(report) {
+  const base = report.scenarios.find((s) => s.name === SCENARIOS[1].name) ?? report.scenarios[0];
+  return { net: base.net_profit, be: report.break_even?.tickets ?? null };
+}
+
+/**
+ * Раздел «История»: список из CloudStorage, сохранение, открытие с возможностью вернуть форму.
+ * edited() — пометить идущий расчёт устаревшим; recalculate() — посчитать заново (в том числе
+ * после текущего запроса). Возвращает onCalculated(snapshot, report) для свежего расчёта.
+ */
+function setupHistory(form, storage, { edited, recalculate }) {
+  const section = document.getElementById("history");
+  const list = document.getElementById("history-list");
+  const count = document.getElementById("history-count");
+  const message = document.getElementById("history-msg");
+  const undoBar = document.getElementById("undo-bar");
+  const saveBox = document.getElementById("save-box");
+  const saveName = document.getElementById("save-name");
+  const saveButton = document.getElementById("save-calc");
+  const saveMessage = document.getElementById("save-msg");
+
+  let items = []; // [{key, record | null}] — null у повреждённых записей, они тоже занимают место
+  let previousDraft = null;
+
+  section.hidden = false;
+  const say = (el, text, bad = false) => {
+    el.textContent = text;
+    el.classList.toggle("bad", bad);
+  };
+
+  function render() {
+    count.textContent = items.length ? `(${items.length})` : "";
+    list.replaceChildren(
+      ...items.map(({ key, record }) => {
+        const item = document.getElementById("history-item-tpl").content.firstElementChild.cloneNode(true);
+        item.dataset.key = key;
+        if (!record) {
+          setText(item, ".name", "Повреждённая запись");
+          item.querySelector(".open-calc").hidden = true;
+          return item;
+        }
+        setText(item, ".name", record.name);
+        setText(item, ".date", new Date(record.savedAt).toLocaleDateString("ru-RU"));
+        const profit = item.querySelector(".profit");
+        profit.textContent = formatMoney(record.summary.net);
+        profit.className = `profit ${signClass(record.summary.net)}`;
+        const be = record.summary.be;
+        let beText = `окупается с ${groupDigits(String(be))} ${plural(be, ["билета", "билетов", "билетов"])}`;
+        if (be === null) beText = "не окупается";
+        else if (be === 0) beText = "окупается с первого билета";
+        setText(item, ".be", beText);
+        return item;
+      }),
+    );
+    say(message, items.length ? "" : "Пока пусто: посчитай концерт и нажми «Сохранить в историю».");
+  }
+
+  async function load() {
+    say(message, "Загружаю…");
+    const keys = (await cloudCall(storage, "getKeys")).filter((k) => k.startsWith(HISTORY_PREFIX));
+    const values = {};
+    for (let i = 0; i < keys.length; i += 25) {
+      Object.assign(values, await cloudCall(storage, "getItems", keys.slice(i, i + 25)));
+    }
+    items = keys.map((key) => ({ key, record: isStr(values[key]) ? unpackRecord(values[key]) : null }));
+    // Свежие сверху, повреждённые в конце
+    items.sort((a, b) => (b.record?.savedAt ?? -1) - (a.record?.savedAt ?? -1));
+    say(message, "");
+    render();
+  }
+
+  function hideUndo() {
+    undoBar.hidden = true;
+    previousDraft = null;
+  }
+
+  function showForm(draft) {
+    applyDraft(form, draft);
+    // Программная подстановка не порождает input: черновик сохраняем сами, а идущий
+    // расчёт помечаем устаревшим — иначе ответ по старой форме покажется под новой
+    edited();
+    saveDraft(form);
+    refreshFormState(form);
+    hideResults();
+  }
+
+  function open(record) {
+    const current = readDraft(form);
+    try {
+      showForm(record.draft);
+    } catch (error) {
+      console.warn("Не удалось открыть запись", error);
+      showForm(current);
+      say(message, "Эту запись не получилось открыть.", true);
+      return;
+    }
+    // «Моя форма» — та, что была до ПЕРВОГО открытия: R1, затем R2 не должны затереть её
+    previousDraft ??= current;
+    document.getElementById("undo-text").textContent = `Открыт «${record.name}».`;
+    undoBar.hidden = false;
+    form.scrollIntoView({ behavior: "smooth", block: "start" });
+    recalculate();
+  }
+
+  async function remove(key, button) {
+    button.disabled = true;
+    try {
+      await cloudCall(storage, "removeItem", key);
+      items = items.filter((item) => item.key !== key);
+      render();
+    } catch (error) {
+      button.disabled = false;
+      say(message, "Не удалось удалить. Попробуй ещё раз.", true);
+      console.warn(error);
+    }
+  }
+
+  async function save() {
+    const calc = lastCalc;
+    if (!calc) return;
+    saveButton.disabled = true;
+    say(saveMessage, "Сохраняю…");
+    // Лимит считаем по загруженной истории: без неё можно записать 51-ю запись
+    try {
+      await loaded;
+    } catch {
+      saveButton.disabled = false;
+      say(saveMessage, "История недоступна. Открой калькулятор заново.", true);
+      return;
+    }
+    // Пока ждали, форму могли поменять и пересчитать: интерфейс уже про другой расчёт
+    const stillCurrent = () => lastCalc === calc;
+    if (!stillCurrent()) return;
+    if (items.length >= HISTORY_LIMIT) {
+      saveButton.disabled = false;
+      say(saveMessage, `История заполнена (${HISTORY_LIMIT}). Удали ненужные расчёты.`, true);
+      return;
+    }
+    const name = saveName.value.trim() || defaultCalcName();
+    const raw = packRecord(name, Date.now(), calc.draft, summaryOf(calc.report));
+    if (byteLength(raw) > CLOUD_MAX_BYTES) {
+      saveButton.disabled = false;
+      say(saveMessage, "Расчёт слишком большой для истории: сократи названия или число статей.", true);
+      return;
+    }
+    const key = newHistoryKey();
+    try {
+      if ((await cloudCall(storage, "setItem", key, raw)) !== true) throw new Error("not stored");
+      items.unshift({ key, record: unpackRecord(raw) });
+      render();
+      if (!stillCurrent()) return;
+      say(saveMessage, "Сохранено ✓");
+      saveButton.textContent = "Сохранено";
+      lastCalc = null; // повторный тап не создаст дубль
+    } catch (error) {
+      console.warn(error);
+      if (!stillCurrent()) return;
+      saveButton.disabled = false;
+      say(
+        saveMessage,
+        error instanceof CloudTimeout
+          ? "Не удалось подтвердить сохранение. Открой калькулятор заново и проверь историю."
+          : "Не удалось сохранить. Попробуй ещё раз.",
+        true,
+      );
+    }
+  }
+
+  list.addEventListener("click", (event) => {
+    const item = event.target.closest(".history-item");
+    if (!item) return;
+    const entry = items.find((i) => i.key === item.dataset.key);
+    if (!entry) return;
+    if (event.target.closest(".open-calc") && entry.record) open(entry.record);
+    const del = event.target.closest(".delete-calc");
+    if (del) remove(entry.key, del);
+  });
+
+  document.getElementById("undo-btn").addEventListener("click", () => {
+    if (previousDraft) showForm(previousDraft);
+    hideUndo();
+  });
+  form.addEventListener("input", hideUndo);
+  saveButton.addEventListener("click", save);
+
+  const loaded = load();
+  loaded.catch((error) => {
+    say(message, "Историю загрузить не удалось. Открой калькулятор заново.", true);
+    console.warn(error);
+  });
+
+  return function onCalculated(snapshot, report) {
+    lastCalc = { draft: snapshot, report };
+    saveName.value = defaultCalcName();
+    saveButton.disabled = false;
+    saveButton.textContent = "Сохранить в историю";
+    say(saveMessage, "");
+    saveBox.hidden = false;
+  };
+}
+
 // ---------- Запуск ----------
 
 function init() {
@@ -586,47 +918,56 @@ function init() {
     }
     applyDraft(form, DEFAULT_DRAFT);
   }
-  updateAddButtons();
-  updateSeatsHint(form);
-  updateProbabilityHint();
-  updateTaxHint(form);
+  refreshFormState(form);
+
+  // Номер правки: если форму поменяли, пока шёл запрос, пришедший ответ уже устарел
+  let editVersion = 0;
+  const edited = () => {
+    editVersion += 1;
+    markResultsStale();
+  };
 
   // Сохраняем сразу, без debounce: Mini App часто закрывают сразу после ввода, а форма весит ~2 КБ
   form.addEventListener("input", () => {
     updateSeatsHint(form);
     updateProbabilityHint();
-    markResultsStale();
+    edited();
     saveDraft(form);
   });
 
   form.querySelector('[data-field="tax_mode"]').addEventListener("change", (event) => {
     form.querySelector('[data-field="tax_rate"]').value = TAX_MODES[event.target.value].rate;
     updateTaxHint(form);
+    edited();
     saveDraft(form);
   });
 
   document.getElementById("add-tier").addEventListener("click", () => {
     addRow("tiers", "tier-tpl").querySelector("input").focus();
     updateAddButtons();
+    edited();
     saveDraft(form);
   });
   document.getElementById("add-cost").addEventListener("click", () => {
     addRow("costs", "cost-tpl").querySelector("input").focus();
     updateAddButtons();
+    edited();
     saveDraft(form);
   });
   form.addEventListener("click", (event) => {
     const button = event.target.closest(".remove");
     if (!button) return;
     button.closest(".row").remove();
-    markResultsStale();
+    edited();
     updateAddButtons();
     updateSeatsHint(form);
     clearErrors(); // индексы строк сдвинулись — старые подсветки неактуальны
     saveDraft(form);
   });
 
+  let onCalculated = null; // появится, если доступна история
   let inFlight = false;
+  let pendingRecalc = false; // программный пересчёт, запрошенный во время идущего запроса
   const setBusy = (busy) => {
     fallbackSubmit.disabled = busy;
     if (!inTelegram) return;
@@ -646,8 +987,14 @@ function init() {
     clearErrors();
     inFlight = true;
     setBusy(true);
+    // Снимок до запроса: в историю уйдут ровно те цифры, по которым посчитано
+    const snapshot = readDraft(form);
+    const version = editVersion;
     try {
-      renderReport(await requestReport(payload, initData, rowIndex));
+      const report = await requestReport(payload, initData, rowIndex);
+      renderReport(report);
+      if (version !== editVersion) markResultsStale();
+      else onCalculated?.(snapshot, report);
     } catch (error) {
       hideResults(); // старые цифры рядом с ошибкой легко принять за текущие
       renderErrors(error instanceof ApiError ? error.errors : [{ path: null, msg: "Что-то пошло не так." }]);
@@ -655,8 +1002,18 @@ function init() {
     } finally {
       inFlight = false;
       setBusy(false);
+      if (pendingRecalc) {
+        pendingRecalc = false;
+        submitForm();
+      }
     }
   });
+
+  const submitForm = () => {
+    // requestSubmit нет в старых WebView (iOS < 16)
+    if (form.requestSubmit) form.requestSubmit();
+    else form.dispatchEvent(new Event("submit", { cancelable: true }));
+  };
 
   if (inTelegram) {
     tg.ready();
@@ -665,14 +1022,20 @@ function init() {
     tg.MainButton.setText("Рассчитать");
     tg.MainButton.show();
     // Обработчик регистрируем один раз: повторные onClick копятся и шлют запрос несколько раз
-    tg.MainButton.onClick(() => {
-      // requestSubmit нет в старых WebView (iOS < 16)
-      if (form.requestSubmit) form.requestSubmit();
-      else form.dispatchEvent(new Event("submit", { cancelable: true }));
-    });
+    tg.MainButton.onClick(submitForm);
   } else {
     document.getElementById("outside-banner").hidden = false;
   }
+
+  // История — только в Telegram с CloudStorage (Bot API 6.9+); грузится в фоне, не задерживая форму
+  const storage = inTelegram ? cloudStorageOf(tg) : null;
+  // Двойной тап по «Рассчитать» по-прежнему гасится inFlight; а открытие записи во время
+  // запроса не должно потеряться — его пересчитаем сразу после текущего
+  const recalculate = () => {
+    if (inFlight) pendingRecalc = true;
+    else submitForm();
+  };
+  if (storage) onCalculated = setupHistory(form, storage, { edited, recalculate });
 }
 
 if (typeof document !== "undefined") {

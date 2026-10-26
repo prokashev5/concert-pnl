@@ -38,6 +38,24 @@ window.Telegram = { WebApp: {
 %s
 """
 
+# CloudStorage в памяти; переживает reload (лежит в localStorage контекста браузера).
+# Callback — через setTimeout, как у настоящего SDK: синхронная заглушка спрятала бы гонки
+CLOUD_STUB = """
+(() => {
+  const KEY = '__cloud_store';
+  const read = () => JSON.parse(localStorage.getItem(KEY) || '{}');
+  const write = (s) => localStorage.setItem(KEY, JSON.stringify(s));
+  const later = (cb, ...args) => cb && setTimeout(() => cb(...args), 0);
+  Telegram.WebApp.isVersionAtLeast = () => true;
+  Telegram.WebApp.CloudStorage = {
+    setItem(k, v, cb) { const s = read(); s[k] = v; write(s); later(cb, null, true); },
+    getItems(keys, cb) { const s = read(); const r = {}; keys.forEach((k) => { r[k] = s[k] ?? ''; }); later(cb, null, r); },
+    getKeys(cb) { later(cb, null, Object.keys(read())); },
+    removeItem(k, cb) { const s = read(); delete s[k]; write(s); later(cb, null, true); },
+  };
+})();
+"""
+
 DARK_THEME = """
 const s = document.documentElement.style;
 s.setProperty('--tg-theme-secondary-bg-color', '#0e1621');
@@ -103,10 +121,11 @@ def open_app(browser, base_url):
     """Открывает Mini App; после теста проверяет, что в консоли не было ошибок JS."""
     contexts, errors = [], []
 
-    def open_(init_data: str | None = None, dark: bool = False):
+    def open_(init_data: str | None = None, dark: bool = False, cloud: bool = False):
         init_data = sign(make_fields()) if init_data is None else init_data
         context = browser.new_context(viewport={"width": 390, "height": 844})
-        stub = SDK_STUB % (json.dumps(init_data), DARK_THEME if dark else "")
+        extra = (DARK_THEME if dark else "") + (CLOUD_STUB if cloud else "")
+        stub = SDK_STUB % (json.dumps(init_data), extra)
         context.route(
             "https://telegram.org/js/telegram-web-app.js",
             lambda route: route.fulfill(body=stub, content_type="application/javascript"),
@@ -310,3 +329,261 @@ def test_outside_telegram(open_app):
     page = open_app(init_data="")
     assert page.is_visible("#outside-banner")
     assert page.is_visible("#fallback-submit")
+
+
+# ---------- История расчётов (CloudStorage) ----------
+
+
+def calculate(page):
+    press_main_button(page)
+    expect(page.locator("#results")).to_be_visible(timeout=5000)
+
+
+def history_items(page):
+    return page.locator("#history-list .history-item")
+
+
+def cloud_store(page) -> dict:
+    return page.evaluate("JSON.parse(localStorage.getItem('__cloud_store') || '{}')")
+
+
+def seed_cloud(page, store: dict):
+    page.evaluate(f"localStorage.setItem('__cloud_store', {json.dumps(json.dumps(store))})")
+    page.reload()
+
+
+def test_history_hidden_without_cloud_storage(open_app):
+    page = open_app()
+    assert page.is_hidden("#history")
+    fill_reference(page)
+    calculate(page)
+    assert page.is_hidden("#save-box")
+
+
+def test_record_roundtrip_drops_empty_costs(open_app):
+    page = open_app()
+    restored = page.evaluate("""() => {
+        const draft = readDraft(document.getElementById('calc'));
+        return expandDraft(compactDraft(draft));
+    }""")
+    assert len(restored["tiers"]) == 1
+    assert restored["costs"] == []  # все статьи по умолчанию пустые
+    assert restored["scenarios"][1] == {"sell_through": "80", "probability": ""}
+
+
+def test_save_list_and_delete(open_app):
+    page = open_app(cloud=True)
+    expect(page.locator("#history")).to_be_visible()
+    fill_reference(page)
+    calculate(page)
+
+    page.fill("#save-name", "Арена, 12 марта")
+    page.click("#save-calc")
+    expect(page.locator("#save-msg")).to_have_text("Сохранено ✓")
+    assert page.is_disabled("#save-calc")  # повторный тап не создаст дубль
+
+    page.click("#history summary")
+    expect(page.locator("#history-msg")).to_have_text("")  # не «Пока пусто» при непустом списке
+    item = history_items(page).first
+    expect(item).to_contain_text("Арена, 12 марта")
+    expect(item).to_contain_text(f"−274{NBSP}800{NBSP}₽")
+    expect(item).to_contain_text("окупается с 864 билетов")
+
+    page.reload()  # запись живёт в облаке, а не в памяти страницы
+    page.click("#history summary")
+    expect(history_items(page)).to_have_count(1)
+
+    history_items(page).first.locator(".delete-calc").click()
+    expect(history_items(page)).to_have_count(0)
+    assert not [k for k in cloud_store(page) if k.startswith("calc_")]
+
+
+def test_open_record_recalculates_and_can_be_undone(open_app):
+    page = open_app(cloud=True)
+    fill_reference(page)
+    calculate(page)
+    page.click("#save-calc")
+    expect(page.locator("#save-msg")).to_have_text("Сохранено ✓")
+
+    # Пользователь начал новый концерт и не сохранил его
+    page.fill('[data-path="capacity"]', "777")
+    page.click("#history summary")
+    history_items(page).first.locator(".open-calc").click()
+
+    expect(page.locator("#undo-bar")).to_be_visible()
+    assert page.input_value('[data-path="capacity"]') == "1000"
+    expect(page.locator("#results")).to_be_visible(timeout=5000)
+    expect(page.locator("#break-even")).to_contain_text("864 билета")
+
+    page.reload()  # открытая запись стала черновиком
+    assert page.input_value('[data-path="capacity"]') == "1000"
+
+
+def save_calculation(page, name: str):
+    calculate(page)
+    page.fill("#save-name", name)
+    page.click("#save-calc")
+    expect(page.locator("#save-msg")).to_have_text("Сохранено ✓")
+
+
+def test_undo_after_opening_two_records_returns_original_form(open_app):
+    page = open_app(cloud=True)
+    fill_reference(page)
+    save_calculation(page, "R1")  # вместимость 1000
+    page.fill('[data-path="capacity"]', "1200")
+    save_calculation(page, "R2")
+
+    page.fill('[data-path="capacity"]', "777")  # несохранённая форма A
+    page.click("#history summary")
+    history_items(page).nth(0).locator(".open-calc").click()  # R2
+    expect(page.locator("#undo-text")).to_contain_text("R2")
+    history_items(page).nth(1).locator(".open-calc").click()  # R1
+    expect(page.locator("#undo-text")).to_contain_text("R1")
+    page.click("#undo-btn")
+    assert page.input_value('[data-path="capacity"]') == "777"
+
+
+HOLD_FETCH = """() => {
+    const realFetch = window.fetch;
+    window.__held = [];
+    window.fetch = async (...args) => {
+        const response = await realFetch(...args);
+        await new Promise((resolve) => window.__held.push(resolve));
+        return response;
+    };
+}"""
+
+
+def release_next_response(page):
+    page.wait_for_function("window.__held.length > 0")
+    page.evaluate("window.__held.shift()()")
+
+
+def test_open_during_request_recalculates_the_opened_record(open_app):
+    page = open_app(cloud=True)
+    fill_reference(page)
+    save_calculation(page, "Запись")  # вместимость 1000, безубыточность 864 билета
+
+    page.fill('[data-path="capacity"]', "1200")
+    page.fill('[data-path="ticketing_fee_rate"]', "20")  # другая форма — другой результат
+    page.evaluate(HOLD_FETCH)
+    press_main_button(page)  # расчёт формы 1200 завис в пути
+    page.wait_for_function("window.__held.length > 0")
+
+    page.click("#history summary")
+    history_items(page).first.locator(".open-calc").click()
+    release_next_response(page)  # ответ по старой форме — должен считаться устаревшим
+    # Промежуток до пересчёта: старый ответ показан, но сохранить его нельзя
+    expect(page.locator("#results")).to_have_class("stale")
+    expect(page.locator("#save-box")).to_be_hidden()
+    release_next_response(page)  # пересчёт открытой записи
+
+    expect(page.locator("#results")).not_to_have_class("stale")
+    expect(page.locator("#break-even")).to_contain_text("864 билета")
+    expect(page.locator("#save-box")).to_be_visible()
+    # В историю уйдёт именно запись, а не форма 1200
+    page.fill("#save-name", "Копия")
+    page.click("#save-calc")
+    expect(page.locator("#save-msg")).to_have_text("Сохранено ✓")
+    saved = [json.loads(v) for v in cloud_store(page).values() if '"Копия"' in v]
+    assert saved[0]["d"]["c"] == "1000"
+    assert saved[0]["d"]["f"] == "10"
+
+
+def test_zero_break_even_text_in_history(open_app):
+    page = open_app(cloud=True)
+    record = {
+        "v": 1, "name": "Без расходов", "savedAt": 1_800_000_000_000,
+        "d": {"c": "100", "k": "", "t": [["A", "100", "100"]], "x": [], "pt": "", "f": "",
+              "m": "income", "r": "6", "vat": "0", "s": [["50", ""], ["80", ""], ["100", ""]]},
+        "s": {"net": "1000.00", "be": 0},
+    }
+    seed_cloud(page, {"calc_zero": json.dumps(record)})
+    page.click("#history summary")
+    expect(history_items(page).first).to_contain_text("окупается с первого билета")
+
+
+def test_undo_restores_unsaved_form(open_app):
+    page = open_app(cloud=True)
+    fill_reference(page)
+    calculate(page)
+    page.click("#save-calc")
+    expect(page.locator("#save-msg")).to_have_text("Сохранено ✓")
+
+    page.fill('[data-path="capacity"]', "777")
+    page.click("#history summary")
+    history_items(page).first.locator(".open-calc").click()
+    expect(page.locator("#undo-bar")).to_be_visible()
+    page.click("#undo-btn")
+    assert page.input_value('[data-path="capacity"]') == "777"
+    page.reload()
+    assert page.input_value('[data-path="capacity"]') == "777"
+
+
+def test_broken_record_is_shown_as_damaged_and_deletable(open_app):
+    page = open_app(cloud=True)
+    seed_cloud(page, {"calc_broken": "{oops", "calc_alien": json.dumps({"v": 99}), "other_key": "x"})
+    page.click("#history summary")
+    items = history_items(page)
+    expect(items).to_have_count(2)  # чужие ключи без префикса не трогаем
+    expect(items.first).to_contain_text("Повреждённая запись")
+    assert items.first.locator(".open-calc").is_hidden()
+    items.first.locator(".delete-calc").click()
+    expect(items).to_have_count(1)
+    assert "other_key" in cloud_store(page)
+
+
+def test_history_limit(open_app):
+    page = open_app(cloud=True)
+    seed_cloud(page, {f"calc_{i:03d}": "{oops" for i in range(50)})
+    fill_reference(page)
+    calculate(page)
+    page.click("#save-calc")
+    expect(page.locator("#save-msg")).to_contain_text("История заполнена (50)")
+    assert len(cloud_store(page)) == 50
+
+
+def test_too_big_record_is_refused(open_app):
+    page = open_app(cloud=True)
+    fill_reference(page)
+    for _ in range(45):
+        page.click("#add-cost")
+    rows = page.locator("#costs .row")
+    for i in range(rows.count()):
+        rows.nth(i).locator('[data-field="name"]').fill("Ж" * 64)
+        rows.nth(i).locator('[data-field="amount"]').fill("1")
+    calculate(page)
+    page.click("#save-calc")
+    expect(page.locator("#save-msg")).to_contain_text("слишком большой")
+    assert not cloud_store(page)
+
+
+def test_editing_after_calculation_hides_save(open_app):
+    page = open_app(cloud=True)
+    fill_reference(page)
+    calculate(page)
+    expect(page.locator("#save-box")).to_be_visible()
+    page.fill('[data-path="per_ticket_cost"]', "60")
+    expect(page.locator("#save-box")).to_be_hidden()
+
+
+def test_edit_during_request_marks_result_stale(open_app):
+    page = open_app(cloud=True)
+    fill_reference(page)
+    # Задерживаем ответ сервера, пока тест не «отпустит» его
+    page.evaluate("""() => {
+        const realFetch = window.fetch;
+        window.fetch = async (...args) => {
+            const response = await realFetch(...args);
+            await new Promise((resolve) => { window.__release = resolve; });
+            return response;
+        };
+    }""")
+    press_main_button(page)
+    page.wait_for_function("typeof window.__release === 'function'")
+    page.fill('[data-path="per_ticket_cost"]', "60")  # правка, пока запрос в пути
+    page.evaluate("window.__release()")
+
+    expect(page.locator("#results")).to_be_visible(timeout=5000)
+    expect(page.locator("#results")).to_have_class("stale")
+    assert page.is_hidden("#save-box")  # устаревшие цифры в историю не сохранить

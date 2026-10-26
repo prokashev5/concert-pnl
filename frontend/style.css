@@ -156,4 +156,27 @@ dt { color: var(--hint); }
 dd { margin: 0; text-align: right; white-space: nowrap; }
 
 .big { font-size: 20px; font-weight: 700; margin: 2px 0 4px; }
+
+#history summary { font-weight: 600; cursor: pointer; }
+.history-list { list-style: none; margin: 10px 0 0; padding: 0; }
+.history-item { padding: 10px 0; border-top: 1px solid var(--border); }
+.history-line { display: flex; justify-content: space-between; gap: 8px; }
+.history-line .name { font-weight: 600; overflow-wrap: anywhere; }
+.history-line .profit { white-space: nowrap; font-weight: 600; }
+.history-actions { display: flex; gap: 16px; }
+.history-actions .link-button { padding: 6px 0 0; }
+
+#undo-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  background: var(--card); /* информация, а не ошибка — без красного фона баннера */
+  border-left: 3px solid var(--accent);
+}
+#undo-bar[hidden] { display: none; }
+#undo-bar .link-button { padding: 0; }
+
+#save-box .primary { margin-top: 4px; }
+#save-box .hint { margin-top: 8px; }
 .warning { color: var(--danger); font-size: 13px; margin: 8px 0 0; }

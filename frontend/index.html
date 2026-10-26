@@ -5,12 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Калькулятор концерта</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <link rel="stylesheet" href="style.css?v=1">
-  <script src="app.js?v=1" defer></script>
+  <link rel="stylesheet" href="style.css?v=2">
+  <script src="app.js?v=2" defer></script>
 </head>
 <body>
   <div id="outside-banner" class="banner" hidden>
     Калькулятор работает только внутри Telegram: открой его кнопкой в чате с ботом.
+  </div>
+
+  <!-- История и плашка отмены — вне формы: их ввод и кнопки не должны трогать форму -->
+  <details id="history" class="card" hidden>
+    <summary>История расчётов <span id="history-count" class="hint"></span></summary>
+    <ul id="history-list" class="history-list"></ul>
+    <p id="history-msg" class="hint"></p>
+    <p class="hint">Прибыль — базовый сценарий на момент сохранения.</p>
+  </details>
+
+  <div id="undo-bar" class="banner" hidden>
+    <span id="undo-text"></span>
+    <button type="button" id="undo-btn" class="link-button">Вернуть мою форму</button>
   </div>
 
   <form id="calc" novalidate>
@@ -93,7 +106,32 @@
     <div id="summary" class="card"></div>
     <div id="scenario-cards"></div>
     <p class="hint">Проданные билеты округляются вниз в каждой категории.</p>
+
+    <div id="save-box" class="card" hidden>
+      <label>Название расчёта
+        <input id="save-name" maxlength="64" autocomplete="off">
+      </label>
+      <button type="button" id="save-calc" class="primary">Сохранить в историю</button>
+      <p id="save-msg" class="hint"></p>
+    </div>
   </section>
+
+  <template id="history-item-tpl">
+    <li class="history-item">
+      <div class="history-line">
+        <span class="name"></span>
+        <span class="profit"></span>
+      </div>
+      <div class="history-line hint">
+        <span class="date"></span>
+        <span class="be"></span>
+      </div>
+      <div class="history-actions">
+        <button type="button" class="link-button open-calc">Открыть</button>
+        <button type="button" class="link-button delete-calc">Удалить</button>
+      </div>
+    </li>
+  </template>
 
   <template id="tier-tpl">
     <div class="row tier-row">
