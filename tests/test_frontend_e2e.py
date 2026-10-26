@@ -60,7 +60,7 @@ def base_url(tmp_path_factory):
         **os.environ,
         "BOT_TOKEN": TOKEN,
         "WEBAPP_URL": "https://example.com",
-        "RUN_BOT": "false",
+        "BOT_MODE": "off",
         "PYTHONPATH": str(ROOT / "src"),
     }
     env.pop("FRONTEND_DIR", None)

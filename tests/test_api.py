@@ -38,7 +38,7 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setenv("BOT_TOKEN", TOKEN)
     monkeypatch.setenv("WEBAPP_URL", "https://example.com")
     monkeypatch.setenv("FRONTEND_DIR", str(tmp_path))
-    monkeypatch.setenv("RUN_BOT", "false")
+    monkeypatch.setenv("BOT_MODE", "off")
     get_settings.cache_clear()
     with TestClient(create_app()) as client:  # with — чтобы прогнать lifespan
         yield client
