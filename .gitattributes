@@ -1,0 +1,3 @@
+# Единые LF-переносы в репозитории: деплой на Linux, разработка на Windows
+* text=auto eol=lf
+*.png binary

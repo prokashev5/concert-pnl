@@ -1,0 +1,31 @@
+[project]
+name = "concert-pnl"
+version = "0.1.0"
+description = "Telegram Mini App: калькулятор рисков и P&L концертов"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.13,<4",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.27",
+    "playwright>=1.48",  # e2e фронта; браузер — системный Edge, качать не нужно
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/concert_pnl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["e2e: фронт в настоящем браузере (Edge); пропускается, если браузера нет"]

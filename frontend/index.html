@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Калькулятор концерта</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="style.css?v=1">
+  <script src="app.js?v=1" defer></script>
+</head>
+<body>
+  <div id="outside-banner" class="banner" hidden>
+    Калькулятор работает только внутри Telegram: открой его кнопкой в чате с ботом.
+  </div>
+
+  <form id="calc" novalidate>
+    <section class="card">
+      <h2>Площадка</h2>
+      <div class="grid-2">
+        <label>Вместимость, мест
+          <input data-path="capacity" data-field="capacity" inputmode="numeric" autocomplete="off">
+        </label>
+        <label>Пригласительные
+          <input data-path="comps" data-field="comps" inputmode="numeric" autocomplete="off" placeholder="0">
+        </label>
+      </div>
+      <p id="seats-hint" class="hint"></p>
+    </section>
+
+    <section class="card">
+      <h2>Билеты</h2>
+      <div id="tiers" class="rows"></div>
+      <button type="button" id="add-tier" class="link-button">+ Категория</button>
+    </section>
+
+    <section class="card">
+      <h2>Расходы</h2>
+      <div id="costs" class="rows"></div>
+      <button type="button" id="add-cost" class="link-button">+ Статья расходов</button>
+      <div class="grid-2">
+        <label>Расход на билет, ₽
+          <input data-path="per_ticket_cost" data-field="per_ticket_cost" inputmode="decimal" autocomplete="off" placeholder="0">
+        </label>
+        <label>Комиссия билетного оператора, %
+          <input data-path="ticketing_fee_rate" data-field="ticketing_fee_rate" inputmode="decimal" autocomplete="off" placeholder="0">
+        </label>
+      </div>
+      <p class="hint">Комиссия считается от выручки с НДС.</p>
+    </section>
+
+    <section class="card">
+      <h2>Налоги</h2>
+      <label>Режим
+        <select data-path="tax.mode" data-field="tax_mode">
+          <option value="income">УСН «Доходы»</option>
+          <option value="income_minus_expenses">УСН «Доходы минус расходы»</option>
+          <option value="profit">ОСН (налог на прибыль)</option>
+        </select>
+      </label>
+      <div class="grid-2">
+        <label>Ставка, %
+          <input data-path="tax.rate" data-field="tax_rate" inputmode="decimal" autocomplete="off">
+        </label>
+        <label>НДС в цене билета
+          <select data-path="tax.vat_rate" data-field="vat_rate">
+            <option value="0">Без НДС</option>
+            <option value="0.05">5%</option>
+            <option value="0.07">7%</option>
+            <option value="0.22">22%</option>
+          </select>
+        </label>
+      </div>
+      <p id="tax-hint" class="hint"></p>
+    </section>
+
+    <section class="card">
+      <h2>Сценарии продаж</h2>
+      <p class="hint">Продажи — % от билетов, выставленных в продажу. Вероятности необязательны:
+        заполни у всех трёх (в сумме 100%), чтобы посчитать ожидаемую прибыль.</p>
+      <div class="scenario-head">
+        <span></span><span>Продано, %</span><span>Вероятность, %</span>
+      </div>
+      <div id="scenarios" class="rows"></div>
+      <p id="prob-hint" class="hint"></p>
+    </section>
+
+    <ul id="form-errors" class="errors" hidden></ul>
+    <button type="submit" id="fallback-submit" class="primary">Рассчитать</button>
+  </form>
+
+  <section id="results" hidden>
+    <div id="break-even" class="card"></div>
+    <div id="summary" class="card"></div>
+    <div id="scenario-cards"></div>
+    <p class="hint">Проданные билеты округляются вниз в каждой категории.</p>
+  </section>
+
+  <template id="tier-tpl">
+    <div class="row tier-row">
+      <input data-field="name" placeholder="Категория" maxlength="64" autocomplete="off">
+      <input data-field="price" inputmode="decimal" placeholder="Цена, ₽" autocomplete="off">
+      <input data-field="quantity" inputmode="numeric" placeholder="Мест" autocomplete="off">
+      <button type="button" class="remove" aria-label="Удалить">×</button>
+    </div>
+  </template>
+
+  <template id="cost-tpl">
+    <div class="row cost-row">
+      <input data-field="name" placeholder="Статья" maxlength="64" autocomplete="off">
+      <input data-field="amount" inputmode="decimal" placeholder="Сумма, ₽" autocomplete="off">
+      <button type="button" class="remove" aria-label="Удалить">×</button>
+    </div>
+  </template>
+
+  <template id="scenario-tpl">
+    <div class="row scenario-row">
+      <span class="scenario-name"></span>
+      <input data-field="sell_through" inputmode="decimal" autocomplete="off">
+      <input data-field="probability" inputmode="decimal" autocomplete="off" placeholder="—">
+    </div>
+  </template>
+
+  <template id="scenario-card-tpl">
+    <article class="card scenario-card">
+      <header>
+        <h3 class="name"></h3>
+        <span class="net-profit"></span>
+      </header>
+      <dl>
+        <dt>Продано билетов</dt><dd class="tickets"></dd>
+        <dt>Выручка</dt><dd class="gross"></dd>
+        <dt>Расходы</dt><dd class="expenses"></dd>
+        <dt>Налог</dt><dd class="tax"></dd>
+        <dt>Маржа</dt><dd class="margin"></dd>
+        <dt>Запас прочности</dt><dd class="safety"></dd>
+      </dl>
+      <p class="warning" hidden></p>
+    </article>
+  </template>
+</body>
+</html>
